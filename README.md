@@ -307,16 +307,14 @@ Rows are sorted by timestamp (stable sort) before anything except the
 structural checks. For tick $t$ with best bid $b_t$, best ask $a_t$ and
 timestamp $T_t$:
 
-$$
-\begin{aligned}
-m_t &= \frac{b_t + a_t}{2} && \text{mid} \\
-s_t &= a_t - b_t && \text{spread} \\
-\Delta t_t &= T_t - T_{t-1} && \text{inter-arrival, seconds} \\
-r_t &= \ln m_t - \ln m_{t-1} && \text{log return} \\
-z_t &= \frac{r_t}{\sqrt{\max(\Delta t_t,\ \Delta t_{\min})}} && \text{normalised return} \\
-\Delta t_{\min} &= \max\bigl(Q_q,\ 0.001\bigr) && \text{floor}
-\end{aligned}
-$$
+| Series | Definition |
+|---|---|
+| mid | $m_t = (b_t + a_t) / 2$ |
+| spread | $s_t = a_t - b_t$ |
+| inter-arrival, seconds | $\Delta t_t = T_t - T_{t-1}$ |
+| log return | $r_t = \ln m_t - \ln m_{t-1}$ |
+| normalised return | $z_t = r_t / \sqrt{\max(\Delta t_t, \Delta t_{\min})}$ |
+| floor | $\Delta t_{\min} = \max(Q_q, 0.001)$ |
 
 where $Q_q$ is the $q$-quantile of the positive inter-arrival times and
 $q$ is `dt_norm_floor_quantile`.
@@ -412,9 +410,11 @@ The Ljung-Box statistic at lag $h$, with the sample autocorrelation
 $\hat\rho_k$:
 
 $$
-\hat\rho_k = \frac{\sum_{t=k+1}^{n} (x_t - \bar x)(x_{t-k} - \bar x)}{\sum_{t=1}^{n} (x_t - \bar x)^2},
-\qquad
-Q_h = n(n+2) \sum_{k=1}^{h} \frac{\hat\rho_k^2}{n-k} \sim \chi^2_h \ \text{under no autocorrelation}
+\hat\rho_k = \frac{\sum_{t=k+1}^{n} (x_t - \bar x)(x_{t-k} - \bar x)}{\sum_{t=1}^{n} (x_t - \bar x)^2}
+$$
+
+$$
+Q_h = n(n+2) \sum_{k=1}^{h} \frac{\hat\rho_k^2}{n-k} \sim \chi^2_h \quad \text{under no autocorrelation}
 $$
 
 Significant autocorrelation of returns at tick level is common (bid-ask
@@ -431,13 +431,13 @@ hypotheses, which is why both are reported.
 **Augmented Dickey-Fuller.** Regression
 
 $$
-\Delta y_t = c + \gamma\, y_{t-1} + \sum_{i=1}^{p} \phi_i\, \Delta y_{t-i} + \varepsilon_t
+\Delta y_t = c + \gamma y_{t-1} + \sum_{i=1}^{p} \phi_i \Delta y_{t-i} + \varepsilon_t
 $$
 
 Null hypothesis: $\gamma = 0$, the series has a unit root (non-stationary).
-Statistic `adf_stat` $= \hat\gamma / \operatorname{se}(\hat\gamma)$, compared with the
+Statistic `adf_stat` $= \hat\gamma / \mathrm{se}(\hat\gamma)$, compared with the
 MacKinnon distribution; `adf_pvalue` is MacKinnon's approximate p-value. The
-lag order $p$ is chosen by AIC among $0, \dots, \lceil 12\,(n/100)^{1/4} \rceil$.
+lag order $p$ is chosen by AIC among $0, \dots, \lceil 12 (n/100)^{1/4} \rceil$.
 `adf_stationary` $= p < \alpha$ (the unit root is rejected).
 
 **KPSS.** Null hypothesis: the series is stationary around its mean. With
@@ -475,16 +475,24 @@ that series $x$. For a centred window of $w$ = `hampel_window` observations
 edges), with $h = \lfloor w/2 \rfloor$ and $\tau$ = `hampel_threshold`:
 
 $$
-\begin{aligned}
-\tilde m_t &= \operatorname{median}(x_{t-h}, \dots, x_{t+h}) \\
-\mathrm{MAD}_t &= \operatorname{median}\bigl(\lvert x_i - \tilde m_t \rvert,\ i = t-h, \dots, t+h\bigr) \\
-\hat\sigma_t &= \begin{cases} 1.4826\,\mathrm{MAD}_t & \text{if } \mathrm{MAD}_t > 0 \\ 1.4826\,\mathrm{MAD}_{\text{global}} & \text{otherwise} \end{cases} \\
-\text{flag}_t &\iff \lvert x_t - \tilde m_t \rvert > \tau\,\hat\sigma_t
-\end{aligned}
+\tilde m_t = \mathrm{median}(x_{t-h}, \dots, x_{t+h})
 $$
 
-where $\mathrm{MAD}_{\text{global}} = \operatorname{median}\,\lvert x - \operatorname{median}(x) \rvert$
-over the whole series.
+$$
+\mathrm{MAD}_t = \mathrm{median}\bigl(\lvert x_i - \tilde m_t \rvert, \quad i = t-h, \dots, t+h\bigr)
+$$
+
+$$
+\hat\sigma_t = 1.4826 \cdot \mathrm{MAD}_t
+$$
+
+$$
+\text{flag}_t \iff \lvert x_t - \tilde m_t \rvert > \tau \hat\sigma_t
+$$
+
+When $\mathrm{MAD}_t$ is zero, $\hat\sigma_t$ falls back to $1.4826 \cdot \mathrm{MAD}_{\mathrm{global}}$
+with $\mathrm{MAD}_{\mathrm{global}} = \mathrm{median} \lvert x - \mathrm{median}(x) \rvert$ over the
+whole series.
 
 $1.4826 = 1 / \Phi^{-1}(3/4)$ makes the MAD a consistent estimator of the
 standard deviation for normal data, so $\tau$ reads as a number of standard
@@ -535,7 +543,7 @@ the earliest last tick across the sources; no overlap is an error. The grid
 is
 
 $$
-T_k = \text{start} + k\,f, \qquad k = 0, \dots, \left\lfloor \frac{\text{end} - \text{start}}{f} \right\rfloor
+T_k = \mathrm{start} + k f, \qquad k = 0, \dots, \left\lfloor \frac{\mathrm{end} - \mathrm{start}}{f} \right\rfloor
 $$
 
 with $f$ = `alignment_freq_s`, and is refused before allocation if it would
@@ -544,22 +552,15 @@ exceed `max_grid_points`.
 **4.3 Alignment.** At each $T_k$ a source contributes its last quote with
 timestamp $\le T_k$, provided $T_k$ minus that timestamp is at most the
 staleness tolerance; otherwise it is missing at $T_k$. The tolerance is
-
-$$
-\text{tol} = \begin{cases}
-s_{\max} & \text{if no source was thinned in 4.1} \\
-\max\left(s_{\max},\ \dfrac{86400}{d}\right) & \text{otherwise}
-\end{cases}
-$$
-
-with $s_{\max}$ = `max_staleness_s` and $d$ = `downsample_points_per_day`;
-the value used is written to the report as `max_staleness_s`.
+$s_{\max}$ = `max_staleness_s` when no source was thinned in 4.1, and
+$\max(s_{\max}, 86400 / d)$ otherwise, with $d$ = `downsample_points_per_day`.
+The value used is written to the report as `max_staleness_s`.
 
 **4.4 Pair statistics.** For each pair of sources (A, B), on the set $C$ of
 grid points where both are present, with mids $a_k$ and $b_k$:
 
 $$
-d_k = a_k - b_k, \qquad d^{\mathrm{bps}}_k = 10^4 \, \frac{d_k}{(a_k + b_k)/2}
+d_k = a_k - b_k, \qquad d^{\mathrm{bps}}_k = 10^4 \cdot \frac{d_k}{(a_k + b_k)/2}
 $$
 
 | Field | Definition |
@@ -568,7 +569,7 @@ $$
 | `n_grid_points`, `n_common_points`, `coverage` | grid size, size of $C$, their ratio |
 | `mean_diff` | mean of $d_k$ |
 | `mean_abs_diff`, `median_abs_diff`, `max_abs_diff` | mean, median, maximum of $\lvert d_k \rvert$ |
-| `rms_diff` | $\sqrt{\operatorname{mean}(d_k^2)}$ |
+| `rms_diff` | $\sqrt{\mathrm{mean}(d_k^2)}$ |
 | `mean_abs_diff_bps`, `max_abs_diff_bps` | mean and maximum of $\lvert d^{\mathrm{bps}}_k \rvert$ |
 | `return_correlation` | Pearson correlation between $\ln a_k - \ln a_{k-1}$ and $\ln b_k - \ln b_{k-1}$ over consecutive points of $C$ |
 | `n_divergences` | number of $k$ with $\lvert d^{\mathrm{bps}}_k \rvert >$ `price_diff_threshold_bps` |
