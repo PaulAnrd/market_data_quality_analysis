@@ -14,6 +14,7 @@ import re
 import sys
 import tempfile
 import time
+import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -271,6 +272,17 @@ def _resolve_column(df_columns: set[str], canonical: str, candidates: list[str])
     return present[0] if present else None
 
 
+def _parse_timestamps(raw: pd.Series, path: str) -> pd.Series:
+    try:
+        ts = pd.to_datetime(raw)
+    except ValueError:
+        ts = pd.to_datetime(raw, utc=True)
+    if ts.dt.tz is not None:
+        logger.warning("%s: timestamps carry a UTC offset -- converted to UTC and stored without offset", path)
+        ts = ts.dt.tz_convert("UTC").dt.tz_localize(None)
+    return ts
+
+
 def load_raw(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
     df_columns = set(df.columns)
@@ -305,7 +317,7 @@ def load_raw(path: str) -> pd.DataFrame:
             )
 
     df = df.rename(columns=rename)
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df["timestamp"] = _parse_timestamps(df["timestamp"], path)
 
     if len(df):
         first = df.iloc[0]
@@ -322,7 +334,7 @@ def load_raw(path: str) -> pd.DataFrame:
 
 
 def compute_returns(mid: pd.Series, dt_s: pd.Series) -> tuple[pd.Series, pd.Series]:
-    log_return = np.log(mid).diff()
+    log_return = np.log(mid.where(mid > 0)).diff()
     positive_dt = dt_s[dt_s > 0]
     dt_floor = max(positive_dt.quantile(CFG.DT_NORM_FLOOR_QUANTILE), 1e-3) if len(positive_dt) else 1e-3
     dt_norm_return = log_return / np.sqrt(dt_s.clip(lower=dt_floor))
@@ -363,7 +375,7 @@ def check_structural(df_raw: pd.DataFrame) -> dict:
     size_cols = [c for lvl in levels for c in (f"best_bid_size_{lvl}", f"best_ask_size_{lvl}")]
     non_positive_sizes = (df_raw[size_cols] <= 0).any(axis=1)
 
-    n_missing = int(df_raw.isna().sum().sum())
+    n_missing = int(df_raw[raw_schema_columns(df_raw)].isna().sum().sum())
 
     return {
         "n_rows": int(len(df_raw)),
@@ -469,6 +481,41 @@ def n_outliers(df: pd.DataFrame) -> int:
     return int(_hampel_mask(r).sum())
 
 
+def _finite(x) -> float | None:
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return None
+    return x if np.isfinite(x) else None
+
+
+def _is_constant(x: pd.Series) -> bool:
+    if len(x) < 2:
+        return True
+    std, mean = _finite(x.std()), _finite(x.mean())
+    return std is None or mean is None or std <= 1e-9 * max(1.0, abs(mean))
+
+
+def _run_test(name: str, fn, *args, **kwargs) -> tuple[float | None, float | None]:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            out = fn(*args, **kwargs)
+        except Exception as exc:
+            logger.warning("%s not computed: %s", name, exc)
+            return None, None
+    stat, pvalue = _finite(out[0]), _finite(out[1])
+    if stat is None or pvalue is None:
+        logger.warning("%s not computed: statistic or p-value is not finite", name)
+        return None, None
+    return stat, pvalue
+
+
+def _ljung_box(x: pd.Series, lags: int) -> tuple[float, float]:
+    lb = acorr_ljungbox(x, lags=[lags], return_df=True)
+    return float(lb["lb_stat"].iloc[0]), float(lb["lb_pvalue"].iloc[0])
+
+
 def check_returns(df: pd.DataFrame) -> dict:
     alpha = CFG.SIGNIFICANCE_LEVEL
     lags = CFG.LJUNG_BOX_LAGS
@@ -476,62 +523,73 @@ def check_returns(df: pd.DataFrame) -> dict:
     r = df["dt_norm_return"].dropna()
     n_out = n_outliers(df)
 
-    jb_stat, jb_pvalue = stats.jarque_bera(r)
-
-    lb = acorr_ljungbox(r, lags=[lags], return_df=True)
-    lb_sq = acorr_ljungbox(r ** 2, lags=[lags], return_df=True)
-
-    adf_stat, adf_pvalue, *_ = adfuller(r, autolag="AIC")
-    kpss_stat, kpss_pvalue, *_ = kpss(r, regression="c", nlags="auto")
+    if _is_constant(r):
+        logger.warning("Returns are constant (stuck feed?); distribution and dependence tests not computable")
+        skew = kurt = None
+        jb_stat = jb_p = lb_stat = lb_p = lbs_stat = lbs_p = adf_stat = adf_p = kpss_stat = kpss_p = None
+    else:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            skew = _finite(stats.skew(r))
+            kurt = _finite(stats.kurtosis(r))
+        jb_stat, jb_p = _run_test("Jarque-Bera", stats.jarque_bera, r)
+        lb_stat, lb_p = _run_test("Ljung-Box (returns)", _ljung_box, r, lags)
+        lbs_stat, lbs_p = _run_test("Ljung-Box (squared returns)", _ljung_box, r ** 2, lags)
+        adf_stat, adf_p = _run_test("ADF (returns)", adfuller, r, autolag="AIC")
+        kpss_stat, kpss_p = _run_test("KPSS (returns)", kpss, r, regression="c", nlags="auto")
 
     return {
         "significance_level": alpha,
         "n_returns": int(len(r)),
-        "mean": float(r.mean()),
-        "std": float(r.std()),
-        "skew": float(stats.skew(r)),
-        "kurtosis_excess": float(stats.kurtosis(r)),
-        "jarque_bera_stat": float(jb_stat),
-        "jarque_bera_pvalue": float(jb_pvalue),
-        "jarque_bera_normal": bool(jb_pvalue > alpha),
+        "mean": _finite(r.mean()),
+        "std": _finite(r.std()),
+        "skew": skew,
+        "kurtosis_excess": kurt,
+        "jarque_bera_stat": jb_stat,
+        "jarque_bera_pvalue": jb_p,
+        "jarque_bera_normal": None if jb_p is None else bool(jb_p > alpha),
         "n_outliers_hampel": n_out,
         "outlier_hampel_window": CFG.HAMPEL_WINDOW,
         "outlier_hampel_threshold": CFG.HAMPEL_THRESHOLD,
         "ljung_box_lags": lags,
-        "ljung_box_stat": float(lb["lb_stat"].iloc[0]),
-        "ljung_box_pvalue": float(lb["lb_pvalue"].iloc[0]),
-        "ljung_box_autocorrelated": bool(lb["lb_pvalue"].iloc[0] < alpha),
-        "ljung_box_sq_stat": float(lb_sq["lb_stat"].iloc[0]),
-        "ljung_box_sq_pvalue": float(lb_sq["lb_pvalue"].iloc[0]),
-        "ljung_box_sq_vol_clustering": bool(lb_sq["lb_pvalue"].iloc[0] < alpha),
-        "adf_stat": float(adf_stat),
-        "adf_pvalue": float(adf_pvalue),
-        "adf_stationary": bool(adf_pvalue < alpha),
-        "kpss_stat": float(kpss_stat),
-        "kpss_pvalue": float(kpss_pvalue),
-        "kpss_stationary": bool(kpss_pvalue > alpha),
+        "ljung_box_stat": lb_stat,
+        "ljung_box_pvalue": lb_p,
+        "ljung_box_autocorrelated": None if lb_p is None else bool(lb_p < alpha),
+        "ljung_box_sq_stat": lbs_stat,
+        "ljung_box_sq_pvalue": lbs_p,
+        "ljung_box_sq_vol_clustering": None if lbs_p is None else bool(lbs_p < alpha),
+        "adf_stat": adf_stat,
+        "adf_pvalue": adf_p,
+        "adf_stationary": None if adf_p is None else bool(adf_p < alpha),
+        "kpss_stat": kpss_stat,
+        "kpss_pvalue": kpss_p,
+        "kpss_stationary": None if kpss_p is None else bool(kpss_p > alpha),
     }
 
 
 def check_price_level(df: pd.DataFrame) -> dict:
     alpha = CFG.SIGNIFICANCE_LEVEL
     p = df["mid"].dropna()
-    adf_stat, adf_pvalue, *_ = adfuller(p, autolag="AIC")
-    kpss_stat, kpss_pvalue, *_ = kpss(p, regression="c", nlags="auto")
+    if _is_constant(p):
+        logger.warning("Mid price is constant over the recording (stuck feed?); stationarity tests not computable")
+        adf_stat = adf_p = kpss_stat = kpss_p = None
+    else:
+        adf_stat, adf_p = _run_test("ADF (price level)", adfuller, p, autolag="AIC")
+        kpss_stat, kpss_p = _run_test("KPSS (price level)", kpss, p, regression="c", nlags="auto")
 
     return {
-        "start": float(p.iloc[0]),
-        "end": float(p.iloc[-1]),
-        "mean": float(p.mean()),
-        "std": float(p.std()),
-        "min": float(p.min()),
-        "max": float(p.max()),
-        "adf_stat": float(adf_stat),
-        "adf_pvalue": float(adf_pvalue),
-        "adf_stationary": bool(adf_pvalue < alpha),
-        "kpss_stat": float(kpss_stat),
-        "kpss_pvalue": float(kpss_pvalue),
-        "kpss_stationary": bool(kpss_pvalue > alpha),
+        "start": _finite(p.iloc[0]) if len(p) else None,
+        "end": _finite(p.iloc[-1]) if len(p) else None,
+        "mean": _finite(p.mean()),
+        "std": _finite(p.std()),
+        "min": _finite(p.min()),
+        "max": _finite(p.max()),
+        "adf_stat": adf_stat,
+        "adf_pvalue": adf_p,
+        "adf_stationary": None if adf_p is None else bool(adf_p < alpha),
+        "kpss_stat": kpss_stat,
+        "kpss_pvalue": kpss_p,
+        "kpss_stationary": None if kpss_p is None else bool(kpss_p > alpha),
     }
 
 
@@ -739,7 +797,7 @@ def compare_pair(aligned: pd.DataFrame, name_a: str, name_b: str) -> dict:
     mid_ref = ((a_c + b_c) / 2).replace(0, np.nan)
     diff_bps = (diff / mid_ref) * 1e4
 
-    ret_a, ret_b = np.log(a_c).diff(), np.log(b_c).diff()
+    ret_a, ret_b = np.log(a_c.where(a_c > 0)).diff(), np.log(b_c.where(b_c > 0)).diff()
     valid_ret = ret_a.notna() & ret_b.notna()
     return_correlation = None
     if valid_ret.sum() > 1:
@@ -1047,16 +1105,18 @@ def generate_all_plots(df: pd.DataFrame, out_dir: str) -> list[str]:
     os.makedirs(out_dir, exist_ok=True)
     plt.rcParams["font.family"] = _FONT["family"]
     plt.rcParams["font.size"] = _FONT["size"]
-    return [
-        plot_price(df, out_dir),
-        plot_spread(df, out_dir),
-        plot_interarrival(df, out_dir),
-        plot_return_hist(df, out_dir),
-        plot_return_qq(df, out_dir),
-        plot_acf_returns(df, out_dir),
-        plot_acf_squared_returns(df, out_dir),
-        plot_activity(df, out_dir),
-    ]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return [
+            plot_price(df, out_dir),
+            plot_spread(df, out_dir),
+            plot_interarrival(df, out_dir),
+            plot_return_hist(df, out_dir),
+            plot_return_qq(df, out_dir),
+            plot_acf_returns(df, out_dir),
+            plot_acf_squared_returns(df, out_dir),
+            plot_activity(df, out_dir),
+        ]
 
 
 def plot_comparison_overlay(aligned: pd.DataFrame, source_names: list[str], out_dir: str) -> str:
@@ -1223,7 +1283,7 @@ def build_report_chart_payload(df: pd.DataFrame, df_raw: pd.DataFrame, report: d
     raw_masks = {
         "crossed": (df_raw["best_bid_1"] >= df_raw["best_ask_1"]).to_numpy(),
         "nonpos_size": (df_raw[size_cols] <= 0).any(axis=1).to_numpy(),
-        "missing": df_raw.isna().any(axis=1).to_numpy(),
+        "missing": df_raw[raw_schema_columns(df_raw)].isna().any(axis=1).to_numpy(),
         "level_bid": level_bid.to_numpy(),
         "level_ask": level_ask.to_numpy(),
         "dup_ts": np.nan_to_num(raw_diffs, nan=1.0) == 0,
@@ -1295,6 +1355,10 @@ def build_report_chart_payload(df: pd.DataFrame, df_raw: pd.DataFrame, report: d
         {"id": "returns", "label": "Returns", "table": "ticks",
          "series": [{"key": "r", "label": "Log-return / sqrt(dt)", "color": s1, "kind": "stem"}],
          "y": {"label": "Return / sqrt(dt)", "zero": True}, "markers": True},
+        {"id": "bidask", "label": "L1 bid / ask", "table": "ticks",
+         "series": [{"key": "bid", "label": "Best bid (L1)", "color": s1, "kind": "step"},
+                    {"key": "ask", "label": "Best ask (L1)", "color": s2, "kind": "step"}],
+         "y": {"label": "Price", "zero": False}, "markers": True},
         {"id": "sizes", "label": "L1 sizes", "table": "ticks",
          "series": [{"key": "bs", "label": "Bid size (L1)", "color": s1, "kind": "step"},
                     {"key": "as", "label": "Ask size (L1)", "color": s2, "kind": "step"}],
@@ -2026,8 +2090,19 @@ def _page(title: str, subtitle: str, meta_html: str, body_html: str, generated_a
 """
 
 
+def _verdict(flag: bool | None, if_true: str, if_false: str) -> str:
+    if flag is None:
+        return "not computable (constant series)"
+    return if_true if flag else if_false
+
+
 def _stationarity_reading(block: dict, expected_nonstationary: bool) -> str:
     adf, kp = block["adf_stationary"], block["kpss_stationary"]
+    if adf is None and kp is None:
+        return "Not computable: the series is constant" + (" -- stuck feed?" if expected_nonstationary else "")
+    if adf is None or kp is None:
+        name, flag = ("KPSS", kp) if adf is None else ("ADF", adf)
+        return f"Only {name} computed: " + ("stationary" if flag else "non-stationary")
     if adf and kp:
         verdict = "Stationary (ADF and KPSS agree)"
     elif not adf and not kp:
@@ -2090,16 +2165,20 @@ def render_dashboard(report: dict, plot_paths: list[str], payload: dict | None =
         _kv("Return outliers (Hampel)", f"{_int(r['n_outliers_hampel'])} ({_pct(r['n_outliers_hampel'] / r['n_returns'] if r['n_returns'] else 0)})"),
     ])
 
-    kurt = r["kurtosis_excess"]
-    tails = ("heavy tails" if kurt > 1 else "light tails" if kurt < -0.5 else "near-normal tails")
+    kurt, skew = r["kurtosis_excess"], r["skew"]
+    if kurt is None or skew is None:
+        distribution = "not computable (constant series)"
+    else:
+        tails = ("heavy tails" if kurt > 1 else "light tails" if kurt < -0.5 else "near-normal tails")
+        distribution = (f"{tails} (excess kurtosis {kurt:,.2f}, skew {skew:,.2f}); "
+                        + _verdict(r["jarque_bera_normal"], "consistent with normal", "normality rejected")
+                        + " (Jarque-Bera)")
     reading_rows = "".join([
         _kv_text("Price level", _esc(_stationarity_reading(pl, expected_nonstationary=True))),
         _kv_text("Returns", _esc(_stationarity_reading(r, expected_nonstationary=False))),
-        _kv_text("Return distribution", _esc(f"{tails} (excess kurtosis {kurt:,.2f}, skew {r['skew']:,.2f}); "
-                                        + ("normality rejected" if not r["jarque_bera_normal"] else "consistent with normal")
-                                        + " (Jarque-Bera)")),
-        _kv_text("Serial dependence", _esc(("autocorrelation present" if r["ljung_box_autocorrelated"] else "no return autocorrelation")
-                                      + "; " + ("volatility clustering present" if r["ljung_box_sq_vol_clustering"] else "no volatility clustering")
+        _kv_text("Return distribution", _esc(distribution)),
+        _kv_text("Serial dependence", _esc(_verdict(r["ljung_box_autocorrelated"], "autocorrelation present", "no return autocorrelation")
+                                      + "; " + _verdict(r["ljung_box_sq_vol_clustering"], "volatility clustering present", "no volatility clustering")
                                       + f" (Ljung-Box, lag {r['ljung_box_lags']})")),
     ])
 
@@ -2184,8 +2263,8 @@ def render_dashboard(report: dict, plot_paths: list[str], payload: dict | None =
         _row("Mean / std. dev.", f"{price(pl['mean'])} / {price(pl['std'])}"),
     ])
     price_tests = "".join([
-        test_row("ADF", pl["adf_stat"], pl["adf_pvalue"], "stationary" if pl["adf_stationary"] else "non-stationary (expected)"),
-        test_row("KPSS", pl["kpss_stat"], pl["kpss_pvalue"], "stationary" if pl["kpss_stationary"] else "non-stationary (expected)"),
+        test_row("ADF", pl["adf_stat"], pl["adf_pvalue"], _verdict(pl["adf_stationary"], "stationary", "non-stationary (expected)")),
+        test_row("KPSS", pl["kpss_stat"], pl["kpss_pvalue"], _verdict(pl["kpss_stationary"], "stationary", "non-stationary (expected)")),
     ])
     return_rows = "".join([
         _row("Returns analysed", _int(r["n_returns"])),
@@ -2196,13 +2275,13 @@ def render_dashboard(report: dict, plot_paths: list[str], payload: dict | None =
     ])
     return_tests = "".join([
         test_row("Jarque-Bera normality", r["jarque_bera_stat"], r["jarque_bera_pvalue"],
-                 "consistent with normal" if r["jarque_bera_normal"] else "normality rejected"),
+                 _verdict(r["jarque_bera_normal"], "consistent with normal", "normality rejected")),
         test_row(f"Ljung-Box, returns (lag {r['ljung_box_lags']})", r["ljung_box_stat"], r["ljung_box_pvalue"],
-                 "autocorrelation present" if r["ljung_box_autocorrelated"] else "no autocorrelation"),
+                 _verdict(r["ljung_box_autocorrelated"], "autocorrelation present", "no autocorrelation")),
         test_row(f"Ljung-Box, squared returns (lag {r['ljung_box_lags']})", r["ljung_box_sq_stat"], r["ljung_box_sq_pvalue"],
-                 "volatility clustering" if r["ljung_box_sq_vol_clustering"] else "no volatility clustering"),
-        test_row("ADF", r["adf_stat"], r["adf_pvalue"], "stationary" if r["adf_stationary"] else "non-stationary"),
-        test_row("KPSS", r["kpss_stat"], r["kpss_pvalue"], "stationary" if r["kpss_stationary"] else "non-stationary"),
+                 _verdict(r["ljung_box_sq_vol_clustering"], "volatility clustering", "no volatility clustering")),
+        test_row("ADF", r["adf_stat"], r["adf_pvalue"], _verdict(r["adf_stationary"], "stationary", "non-stationary")),
+        test_row("KPSS", r["kpss_stat"], r["kpss_pvalue"], _verdict(r["kpss_stationary"], "stationary", "non-stationary")),
     ])
     figures = "".join([
         _figure(plot_paths, "04_return_hist.png", "Time-normalized log-return distribution against a normal fit"),
@@ -2577,9 +2656,6 @@ def _run_comparison_core(
     instrument: dict | None = None,
 ) -> dict:
     downsample_points_per_day = CFG.COMPARISON_DOWNSAMPLE_POINTS_PER_DAY
-    effective_staleness_s = CFG.COMPARISON_MAX_STALENESS_S
-    if downsample_points_per_day > 0:
-        effective_staleness_s = max(effective_staleness_s, SECONDS_PER_DAY / downsample_points_per_day)
 
     sources = {}
     raw_row_counts = {}
@@ -2602,6 +2678,11 @@ def _run_comparison_core(
                 path.name, n_raw, len(df_raw), downsample_points_per_day,
             )
         sources[label] = enrich(df_raw)
+    effective_staleness_s = CFG.COMPARISON_MAX_STALENESS_S
+    if raw_row_counts:
+        effective_staleness_s = max(effective_staleness_s, SECONDS_PER_DAY / downsample_points_per_day)
+        logger.info("Staleness tolerance set to %.1fs because %d source(s) were thinned",
+                    effective_staleness_s, len(raw_row_counts))
     check_memory_budget("loading comparison sources")
 
     report, aligned = compare_sources(sources, max_staleness_s=effective_staleness_s)
@@ -2951,7 +3032,13 @@ def _expand(patterns: list[str]) -> list[Path]:
     matches = []
     for pattern in patterns:
         matches.extend(sorted(glob.glob(pattern)))
-    return resolve_inputs(matches)
+    unique, seen = [], set()
+    for path in resolve_inputs(matches):
+        key = path.resolve()
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
 
 
 def _run_pipeline(argv: list[str]) -> None:

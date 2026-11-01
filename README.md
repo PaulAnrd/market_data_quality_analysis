@@ -62,7 +62,8 @@ report_dir = report
 
 Leave either list empty to skip that phase. Globs resolve against the
 current working directory; a bare directory expands to the `.csv` and
-`.txt` files directly inside it.
+`.txt` files directly inside it. A file matched by more than one pattern
+is processed once.
 
 The shipped `config.ini` runs both phases on the sample data. Open the
 results in a browser:
@@ -101,10 +102,11 @@ timestamp,best_bid_1,best_ask_1,best_bid_size_1,best_ask_size_1,best_bid_2,best_
   rejected as malformed.
 - Header names are mapped in `[columns]`, so vendor files need no editing.
 - Timestamps are parsed by pandas (ISO 8601 or `YYYY-MM-DD HH:MM:SS.fff`,
-  any sub-second precision) and used as recorded. No timezone conversion is
-  applied, so feeds that are compared must share a clock basis.
-- Columns outside the schema are ignored, except that their empty cells
-  still count toward the missing-values check.
+  any sub-second precision). Timestamps without an offset are used as
+  recorded. Timestamps with an offset (`Z`, `+01:00`) are converted to UTC
+  and the offset is dropped, with a logged warning. Feeds that are compared
+  must therefore share a clock basis.
+- Columns outside the schema are ignored.
 - A first row whose best bid or ask is empty, zero or negative is treated
   as a zeroed start-up row and dropped, with a logged warning.
 - A file with fewer than `[general] min_rows` rows is rejected.
@@ -159,8 +161,8 @@ below: alerts and summary, recording status, time-series analysis. In the
 explorer, drag to pan, scroll to zoom, double-click for the full session,
 drag on the overview strip to select a range; the arrow keys, `+`/`-` and
 `Home` work when the chart has focus. The series switch offers mid with the
-bid/ask band, spread, normalised returns, level-1 sizes and tick activity
-(on the comparison page: mid by source and one difference-in-bps view per
+bid/ask band, spread, normalised returns, best bid and ask, level-1 sizes
+and tick activity (on the comparison page: mid by source and one difference-in-bps view per
 pair). Lanes above the plot mark exceptions, Hampel outliers and gaps. Every
 timestamp in the tables links into the explorer and pins that moment; the
 page URL then carries `#mode=<series>&t=<epoch-ms>` and can be shared. The
@@ -283,11 +285,11 @@ minutes.
 | `downsample_min_rows` | 1,000,000 | sources with fewer rows are never thinned |
 
 `alignment_freq_s` should be no finer than the feeds' typical inter-arrival
-time, and `max_staleness_s` a small multiple of it. When
-`downsample_points_per_day` is non-zero the staleness tolerance is raised
-to at least `86400 / downsample_points_per_day` seconds (86.4 s with the
-defaults), whether or not any source was actually thinned; set it to 0 to
-compare at exactly `max_staleness_s`.
+time, and `max_staleness_s` a small multiple of it. When at least one
+source was actually thinned, the staleness tolerance is raised to
+`86400 / downsample_points_per_day` seconds if that is larger (86.4 s with
+the defaults), since a thinned source only carries one quote per that
+interval. The value used is written to the report.
 
 ### `[dashboard]`
 
@@ -314,6 +316,11 @@ normalised     z_t  = r_t / sqrt( max(dt_t, dt_floor) )
                dt_floor = max( Q_q({dt > 0}), 0.001 )     q = dt_norm_floor_quantile
 ```
 
+A tick whose mid is zero or negative (a zeroed row inside the file) has no
+log return: that return and the next are left undefined and excluded from
+the return statistics, while the row itself is caught by the integrity
+checks.
+
 Under a diffusion the variance of a return over an interval is proportional
 to the interval, so dividing by sqrt(dt) puts a quote that arrives after a
 long silence on the same footing as one that arrives a millisecond later.
@@ -336,7 +343,7 @@ series. The `structural` section also records `n_rows` and
 | structural | `n_level_bid_inconsistent` | for some consecutive present levels k < k': bid_(k') > bid_k |
 | structural | `n_level_ask_inconsistent` | for some consecutive present levels k < k': ask_(k') < ask_k |
 | structural | `n_non_positive_sizes` | any size at any present level <= 0 |
-| structural | `n_missing_values` | empty cells, counted per cell over every column of the file |
+| structural | `n_missing_values` | empty cells in the schema columns (timestamp, bids, asks and sizes of the present levels), counted per cell |
 | continuity | `n_gaps_over_threshold` | dt_t > gap_threshold_s |
 | liquidity | `n_negative_spread` | s_t < 0 |
 | liquidity | `n_zero_or_negative_sizes` | any size at any present level <= 0 |
@@ -441,6 +448,12 @@ published critical-value table and is therefore bounded: 0.01 means "beyond
 the 1% critical value" and 0.1 means "below the 10% critical value".
 `kpss_stationary` = p-value > alpha (stationarity is not rejected).
 
+A constant series (a stuck feed) has no variance to test. In that case the
+skewness, kurtosis and every test statistic, p-value and verdict are
+`null` in the JSON, the dashboard reads "not computable" in their place,
+and the run still succeeds, since a frozen recording is precisely what the
+report must show.
+
 The dashboard reads the pair as *stationary* when ADF rejects the unit root
 and KPSS does not reject stationarity, *non-stationary* when neither
 rejects, and *mixed* otherwise (typically a near-unit-root or a series with
@@ -519,8 +532,8 @@ timestamp <= T_k, provided T_k minus that timestamp is at most the
 staleness tolerance; otherwise it is missing at T_k. The tolerance is
 
 ```
-tol = max_staleness_s                                     if downsample_points_per_day = 0
-    = max( max_staleness_s, 86400 / downsample_points_per_day )   otherwise
+tol = max_staleness_s                                            if no source was thinned in 4.1
+    = max( max_staleness_s, 86400 / downsample_points_per_day )  otherwise
 ```
 
 and the value used is written to the report as `max_staleness_s`.
