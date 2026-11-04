@@ -66,6 +66,7 @@ class Config:
         self.MIN_ROWS = p.getint("general", "min_rows")
         if self.MIN_ROWS < 1:
             raise ValueError(f"config.ini [general] min_rows={self.MIN_ROWS} must be at least 1.")
+        self.IGNORE_ZEROS = p.getboolean("general", "ignore_zeros", fallback=False)
         self.MAX_MEMORY_BUDGET_GB = p.getfloat("general", "max_memory_budget_gb")
         self.MAX_MEMORY_BUDGET_BYTES = int(self.MAX_MEMORY_BUDGET_GB * 1024 ** 3)
         self.MEMORY_OVERHEAD_MULTIPLIER = p.getfloat("general", "memory_overhead_multiplier")
@@ -262,6 +263,39 @@ def raw_schema_columns(df: pd.DataFrame) -> list[str]:
     return cols
 
 
+def price_columns(df: pd.DataFrame) -> list[str]:
+    return [c for lvl in present_levels(df) for c in (f"best_bid_{lvl}", f"best_ask_{lvl}")]
+
+
+def size_columns(df: pd.DataFrame) -> list[str]:
+    return [c for lvl in present_levels(df) for c in (f"best_bid_size_{lvl}", f"best_ask_size_{lvl}")]
+
+
+def zero_as_missing(values):
+    return values.where(values != 0) if CFG.IGNORE_ZEROS else values
+
+
+def n_zero_values_ignored(df: pd.DataFrame) -> int:
+    if not CFG.IGNORE_ZEROS:
+        return 0
+    return int((df[price_columns(df) + size_columns(df)] == 0).sum().sum())
+
+
+def book_masks(df: pd.DataFrame) -> dict[str, pd.Series]:
+    levels = present_levels(df)
+    book = zero_as_missing(df[price_columns(df) + size_columns(df)])
+    level_bid = pd.Series(False, index=df.index)
+    level_ask = pd.Series(False, index=df.index)
+    for lo, hi in zip(levels, levels[1:]):
+        level_bid |= book[f"best_bid_{hi}"] > book[f"best_bid_{lo}"]
+        level_ask |= book[f"best_ask_{hi}"] < book[f"best_ask_{lo}"]
+    return {
+        "level_bid": level_bid,
+        "level_ask": level_ask,
+        "nonpos_size": (book[size_columns(df)] <= 0).any(axis=1),
+    }
+
+
 def _resolve_column(df_columns: set[str], canonical: str, candidates: list[str]) -> str | None:
     present = [c for c in candidates if c in df_columns]
     if len(present) > 1:
@@ -283,7 +317,7 @@ def _parse_timestamps(raw: pd.Series, path: str) -> pd.Series:
     return ts
 
 
-def load_raw(path: str) -> pd.DataFrame:
+def load_raw(path: str) -> tuple[pd.DataFrame, int]:
     df = pd.read_csv(path)
     df_columns = set(df.columns)
 
@@ -319,6 +353,17 @@ def load_raw(path: str) -> pd.DataFrame:
     df = df.rename(columns=rename)
     df["timestamp"] = _parse_timestamps(df["timestamp"], path)
 
+    n_zero_rows = 0
+    if CFG.IGNORE_ZEROS:
+        zero_quote = (df["best_bid_1"] == 0) | (df["best_ask_1"] == 0)
+        n_zero_rows = int(zero_quote.sum())
+        if n_zero_rows:
+            logger.info(
+                "%s: ignoring %d of %d row(s) with a zero best bid or ask (config.ini [general] ignore_zeros)",
+                path, n_zero_rows, len(df),
+            )
+            df = df.loc[~zero_quote].reset_index(drop=True)
+
     if len(df):
         first = df.iloc[0]
         if pd.isna(first["best_bid_1"]) or pd.isna(first["best_ask_1"]) \
@@ -330,7 +375,7 @@ def load_raw(path: str) -> pd.DataFrame:
             )
             df = df.iloc[1:].reset_index(drop=True)
 
-    return df
+    return df, n_zero_rows
 
 
 def compute_returns(mid: pd.Series, dt_s: pd.Series) -> tuple[pd.Series, pd.Series]:
@@ -353,10 +398,11 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_quotes(path: str) -> pd.DataFrame:
-    return enrich(load_raw(path))
+    df_raw, _ = load_raw(path)
+    return enrich(df_raw)
 
 
-def check_structural(df_raw: pd.DataFrame) -> dict:
+def check_structural(df_raw: pd.DataFrame, n_zero_rows_ignored: int = 0) -> dict:
     ts = df_raw["timestamp"]
     diffs = ts.diff().dt.total_seconds()
 
@@ -364,28 +410,22 @@ def check_structural(df_raw: pd.DataFrame) -> dict:
     n_out_of_order = int((diffs < 0).sum())
 
     crossed = df_raw["best_bid_1"] >= df_raw["best_ask_1"]
-
-    levels = present_levels(df_raw)
-    level_bid_inconsistent = pd.Series(False, index=df_raw.index)
-    level_ask_inconsistent = pd.Series(False, index=df_raw.index)
-    for lo, hi in zip(levels, levels[1:]):
-        level_bid_inconsistent |= df_raw[f"best_bid_{hi}"] > df_raw[f"best_bid_{lo}"]
-        level_ask_inconsistent |= df_raw[f"best_ask_{hi}"] < df_raw[f"best_ask_{lo}"]
-
-    size_cols = [c for lvl in levels for c in (f"best_bid_size_{lvl}", f"best_ask_size_{lvl}")]
-    non_positive_sizes = (df_raw[size_cols] <= 0).any(axis=1)
+    book = book_masks(df_raw)
 
     n_missing = int(df_raw[raw_schema_columns(df_raw)].isna().sum().sum())
 
     return {
         "n_rows": int(len(df_raw)),
-        "n_levels_present": len(levels),
+        "n_levels_present": len(present_levels(df_raw)),
+        "ignore_zeros": CFG.IGNORE_ZEROS,
+        "n_zero_rows_ignored": int(n_zero_rows_ignored),
+        "n_zero_values_ignored": n_zero_values_ignored(df_raw),
         "n_duplicate_timestamps": n_duplicate_timestamps,
         "n_out_of_order_timestamps": n_out_of_order,
         "n_crossed_book": int(crossed.sum()),
-        "n_level_bid_inconsistent": int(level_bid_inconsistent.sum()),
-        "n_level_ask_inconsistent": int(level_ask_inconsistent.sum()),
-        "n_non_positive_sizes": int(non_positive_sizes.sum()),
+        "n_level_bid_inconsistent": int(book["level_bid"].sum()),
+        "n_level_ask_inconsistent": int(book["level_ask"].sum()),
+        "n_non_positive_sizes": int(book["nonpos_size"].sum()),
         "n_missing_values": n_missing,
     }
 
@@ -425,8 +465,6 @@ def ticks_per_minute(df: pd.DataFrame) -> pd.Series:
 
 def check_liquidity(df: pd.DataFrame) -> dict:
     spread = df["spread"]
-    levels = present_levels(df)
-    size_cols = [c for lvl in levels for c in (f"best_bid_size_{lvl}", f"best_ask_size_{lvl}")]
 
     return {
         "spread_mean": float(spread.mean()),
@@ -436,9 +474,9 @@ def check_liquidity(df: pd.DataFrame) -> dict:
         "spread_max": float(spread.max()),
         "n_negative_spread": int((spread < 0).sum()),
         "n_zero_spread": int((spread == 0).sum()),
-        "n_zero_or_negative_sizes": int((df[size_cols] <= 0).any(axis=1).sum()),
-        "bid_size_1_median": float(df["best_bid_size_1"].median()),
-        "ask_size_1_median": float(df["best_ask_size_1"].median()),
+        "n_zero_or_negative_sizes": int(book_masks(df)["nonpos_size"].sum()),
+        "bid_size_1_median": _finite(zero_as_missing(df["best_bid_size_1"]).median()),
+        "ask_size_1_median": _finite(zero_as_missing(df["best_ask_size_1"]).median()),
     }
 
 
@@ -651,7 +689,11 @@ def treat_outliers(df: pd.DataFrame, mode: int | None = None) -> pd.DataFrame:
     new_mid = _REPLACERS[mode](df["mid"], mask)
     delta = new_mid - df.loc[mask, "mid"]
     for col in _shifted_quote_columns(df):
-        df.loc[mask, col] = df.loc[mask, col] + delta
+        values = df.loc[mask, col]
+        shifted = values + delta
+        if CFG.IGNORE_ZEROS:
+            shifted = shifted.where(values != 0, values)
+        df.loc[mask, col] = shifted
     df.loc[mask, "mid"] = new_mid
     df.loc[mask, "spread"] = df.loc[mask, "best_ask_1"] - df.loc[mask, "best_bid_1"]
     df["log_return"], df["dt_norm_return"] = compute_returns(df["mid"], df["dt_s"])
@@ -975,6 +1017,27 @@ def _save(fig, out_dir: str, name: str) -> str:
     return path
 
 
+class FigureNotComputable(Exception):
+    pass
+
+
+def _returns_for_figure(df: pd.DataFrame) -> pd.Series:
+    r = df["dt_norm_return"].dropna()
+    if _is_constant(r):
+        raise FigureNotComputable("returns are constant or undefined")
+    return r
+
+
+def _placeholder_figure(out_dir: str, name: str, title: str, reason: str) -> str:
+    fig, ax = _new_fig()
+    ax.set_title(title)
+    ax.text(0.5, 0.5, f"Not computable: {reason}", ha="center", va="center",
+            transform=ax.transAxes, color=INK_SECONDARY)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    return _save(fig, out_dir, name)
+
+
 def plot_price(df: pd.DataFrame, out_dir: str) -> str:
     fig, ax = _new_fig()
     ax.fill_between(df["timestamp"], df["best_bid_1"], df["best_ask_1"],
@@ -1035,7 +1098,7 @@ def plot_interarrival(df: pd.DataFrame, out_dir: str) -> str:
 
 
 def plot_return_hist(df: pd.DataFrame, out_dir: str) -> str:
-    r = df["dt_norm_return"].dropna()
+    r = _returns_for_figure(df)
     fig, ax = _new_fig()
     ax.hist(r, bins=60, density=True, color=SERIES_1, alpha=0.9,
             edgecolor=SURFACE, linewidth=0.4, label="Observed")
@@ -1050,7 +1113,7 @@ def plot_return_hist(df: pd.DataFrame, out_dir: str) -> str:
 
 
 def plot_return_qq(df: pd.DataFrame, out_dir: str) -> str:
-    r = df["dt_norm_return"].dropna()
+    r = _returns_for_figure(df)
     fig, ax = _new_fig()
     (osm, osr), (slope, intercept, _) = stats.probplot(r, dist="norm")
     ax.scatter(osm, osr, color=SERIES_1, s=8, alpha=0.7, linewidths=0, label="Returns")
@@ -1080,12 +1143,12 @@ def _plot_acf_series(series: pd.Series, title: str, out_dir: str, name: str, nla
 
 
 def plot_acf_returns(df: pd.DataFrame, out_dir: str, nlags: int = 20) -> str:
-    r = df["dt_norm_return"].dropna()
+    r = _returns_for_figure(df)
     return _plot_acf_series(r, "Autocorrelation of returns", out_dir, "06_acf_returns.png", nlags)
 
 
 def plot_acf_squared_returns(df: pd.DataFrame, out_dir: str, nlags: int = 20) -> str:
-    r = df["dt_norm_return"].dropna()
+    r = _returns_for_figure(df)
     return _plot_acf_series(r ** 2, "Autocorrelation of squared returns (volatility clustering)",
                             out_dir, "07_acf_squared_returns.png", nlags)
 
@@ -1105,18 +1168,30 @@ def generate_all_plots(df: pd.DataFrame, out_dir: str) -> list[str]:
     os.makedirs(out_dir, exist_ok=True)
     plt.rcParams["font.family"] = _FONT["family"]
     plt.rcParams["font.size"] = _FONT["size"]
+    figures = [
+        (plot_price, "01_price_timeseries.png", "Mid price with bid/ask range"),
+        (plot_spread, "02_spread_timeseries.png", "Best bid/ask spread"),
+        (plot_interarrival, "03_interarrival_hist.png", "Inter-arrival time distribution"),
+        (plot_return_hist, "04_return_hist.png", "Time-normalized log-return distribution"),
+        (plot_return_qq, "05_return_qq.png", "Normal Q-Q plot of returns"),
+        (plot_acf_returns, "06_acf_returns.png", "Autocorrelation of returns"),
+        (plot_acf_squared_returns, "07_acf_squared_returns.png", "Autocorrelation of squared returns (volatility clustering)"),
+        (plot_activity, "08_activity_profile.png", "Tick activity per minute"),
+    ]
+    paths = []
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        return [
-            plot_price(df, out_dir),
-            plot_spread(df, out_dir),
-            plot_interarrival(df, out_dir),
-            plot_return_hist(df, out_dir),
-            plot_return_qq(df, out_dir),
-            plot_acf_returns(df, out_dir),
-            plot_acf_squared_returns(df, out_dir),
-            plot_activity(df, out_dir),
-        ]
+        for fn, name, title in figures:
+            try:
+                paths.append(fn(df, out_dir))
+            except FigureNotComputable as exc:
+                plt.close("all")
+                paths.append(_placeholder_figure(out_dir, name, title, str(exc)))
+            except Exception as exc:
+                plt.close("all")
+                logger.warning("Figure %s could not be drawn: %s", name, exc)
+                paths.append(_placeholder_figure(out_dir, name, title, "see the pipeline log"))
+    return paths
 
 
 def plot_comparison_overlay(aligned: pd.DataFrame, source_names: list[str], out_dir: str) -> str:
@@ -1270,22 +1345,15 @@ def _infer_price_decimals(df_raw: pd.DataFrame) -> int:
 def build_report_chart_payload(df: pd.DataFrame, df_raw: pd.DataFrame, report: dict) -> dict:
     n = len(df)
     order = np.argsort(df_raw["timestamp"].to_numpy(), kind="stable")
-    levels = present_levels(df_raw)
-    size_cols = [c for lvl in levels for c in (f"best_bid_size_{lvl}", f"best_ask_size_{lvl}")]
     raw_diffs = df_raw["timestamp"].diff().dt.total_seconds().to_numpy()
-
-    level_bid = pd.Series(False, index=df_raw.index)
-    level_ask = pd.Series(False, index=df_raw.index)
-    for lo, hi in zip(levels, levels[1:]):
-        level_bid |= df_raw[f"best_bid_{hi}"] > df_raw[f"best_bid_{lo}"]
-        level_ask |= df_raw[f"best_ask_{hi}"] < df_raw[f"best_ask_{lo}"]
+    book = book_masks(df_raw)
 
     raw_masks = {
         "crossed": (df_raw["best_bid_1"] >= df_raw["best_ask_1"]).to_numpy(),
-        "nonpos_size": (df_raw[size_cols] <= 0).any(axis=1).to_numpy(),
+        "nonpos_size": book["nonpos_size"].to_numpy(),
         "missing": df_raw[raw_schema_columns(df_raw)].isna().any(axis=1).to_numpy(),
-        "level_bid": level_bid.to_numpy(),
-        "level_ask": level_ask.to_numpy(),
+        "level_bid": book["level_bid"].to_numpy(),
+        "level_ask": book["level_ask"].to_numpy(),
         "dup_ts": np.nan_to_num(raw_diffs, nan=1.0) == 0,
         "out_of_order": np.nan_to_num(raw_diffs, nan=1.0) < 0,
     }
@@ -1308,8 +1376,8 @@ def build_report_chart_payload(df: pd.DataFrame, df_raw: pd.DataFrame, report: d
         "ask": _col(sub["best_ask_1"], 8),
         "mid": _col(sub["mid"], 8),
         "spread": _col(sub["spread"], 8),
-        "bs": _col(sub["best_bid_size_1"], 4),
-        "as": _col(sub["best_ask_size_1"], 4),
+        "bs": _col(zero_as_missing(sub["best_bid_size_1"]), 4),
+        "as": _col(zero_as_missing(sub["best_ask_size_1"]), 4),
         "r": _col(sub["dt_norm_return"], 7),
         "dt": _col(sub["dt_s"], 6),
         "f": flags[keep].tolist(),
@@ -2127,7 +2195,8 @@ def render_dashboard(report: dict, plot_paths: list[str], payload: dict | None =
     tiles = "".join([
         _tile("Checks with exceptions", f"{n_exceptions} <small>of {n_checks}</small>",
               "data-integrity checks that fired" if n_exceptions else "no data-integrity exception", alert=n_exceptions > 0),
-        _tile("Ticks recorded", _int(n_rows), f"{s['n_levels_present']} book level{'s' if s['n_levels_present'] != 1 else ''}"),
+        _tile("Ticks recorded", _int(n_rows), f"{s['n_levels_present']} book level{'s' if s['n_levels_present'] != 1 else ''}"
+              + (f"; {_int(s['n_zero_rows_ignored'])} zero rows ignored" if s.get("n_zero_rows_ignored") else "")),
         _tile("Session", _esc(_duration(c["session_duration_s"])),
               f"{_esc(_fmt_ts(c['session_start'], multi_day))} &ndash; {_esc(_fmt_ts(c['session_end'], multi_day))}"),
     ])
@@ -2204,6 +2273,9 @@ def render_dashboard(report: dict, plot_paths: list[str], payload: dict | None =
     structural_rows = "".join([
         _row("Rows processed", _int(n_rows)),
         _row("Order-book levels present", _int(s["n_levels_present"])),
+        *([_row("Zero-quote rows ignored", _int(s["n_zero_rows_ignored"]), "best bid or ask was 0"),
+           _row("Zero values ignored", _int(s["n_zero_values_ignored"]), "depth or size was 0")]
+          if s.get("ignore_zeros") else []),
         _exception_row("Duplicate timestamps", s["n_duplicate_timestamps"]),
         _exception_row("Out-of-order timestamps", s["n_out_of_order_timestamps"]),
         _exception_row("Crossed book ticks (bid >= ask)", s["n_crossed_book"]),
@@ -2233,7 +2305,7 @@ def render_dashboard(report: dict, plot_paths: list[str], payload: dict | None =
         _exception_row("Negative spread ticks", l["n_negative_spread"]),
         _row("Zero spread ticks (locked book)", _int(l["n_zero_spread"])),
         _exception_row("Zero-or-negative sizes", l["n_zero_or_negative_sizes"]),
-        _row("Median L1 bid / ask size", f"{l['bid_size_1_median']:,.0f} / {l['ask_size_1_median']:,.0f}"),
+        _row("Median L1 bid / ask size", f"{_fixed(l['bid_size_1_median'], 0)} / {_fixed(l['ask_size_1_median'], 0)}"),
     ])
     col2 = f"""
     <div>
@@ -2413,7 +2485,10 @@ def render_comparison_dashboard(report: dict, plot_paths: list[str], payload: di
         if "metadata" in src:
             m = src["metadata"]
             rows.append(_kv("Market / server / feed", _esc(" / ".join(x or "-" for x in (m["market"], m["server"], m["source"])))))
-        rows_val = _int(src["n_rows"]) + (f' <span class="note-cell">(thinned from {_int(src["raw_rows"])})</span>' if "raw_rows" in src else "")
+        rows_val = (_int(src["n_rows"])
+                    + (f' <span class="note-cell">(thinned from {_int(src["raw_rows"])})</span>' if "raw_rows" in src else "")
+                    + (f' <span class="note-cell">({_int(src["n_zero_rows_ignored"])} zero rows ignored)</span>'
+                       if src.get("n_zero_rows_ignored") else ""))
         rows.append(_kv("Rows", rows_val))
         rows.append(_kv("First / last tick", f"{_esc(_fmt_ts(src['session_start'], True))} / {_esc(_fmt_ts(src['session_end'], multi_day))}"))
         source_blocks.append(f'<h3>{_esc(src["source"])}</h3><table class="kv"><tbody>{"".join(rows)}</tbody></table>')
@@ -2569,10 +2644,11 @@ def run(input_path: Path, output_dir: Path, report_dir: Path) -> dict:
 
     check_file_is_safe_to_load(input_path)
 
-    df_raw = load_raw(str(input_path))
+    df_raw, n_zero_rows = load_raw(str(input_path))
     if len(df_raw) < CFG.MIN_ROWS:
+        ignored = f" after ignoring {n_zero_rows} zero-quote row(s)" if n_zero_rows else ""
         raise ValueError(
-            f"Recording has only {len(df_raw)} rows; need at least "
+            f"Recording has only {len(df_raw)} rows{ignored}; need at least "
             f"{CFG.MIN_ROWS} for a meaningful assessment "
             f"(see config.ini [general] min_rows)."
         )
@@ -2585,7 +2661,7 @@ def run(input_path: Path, output_dir: Path, report_dir: Path) -> dict:
     report = {
         "source_file": input_path.name,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "structural": check_structural(df_raw),
+        "structural": check_structural(df_raw, n_zero_rows),
         "continuity": check_continuity(df),
         "price_level": check_price_level(df),
         "returns": check_returns(df),
@@ -2659,14 +2735,16 @@ def _run_comparison_core(
 
     sources = {}
     raw_row_counts = {}
+    zero_row_counts = {}
     for label, path in labeled_paths.items():
         if not path.is_file():
             raise FileNotFoundError(f"Input file not found: {path}")
         check_file_is_safe_to_load(path)
-        df_raw = load_raw(str(path))
+        df_raw, zero_row_counts[label] = load_raw(str(path))
         if len(df_raw) < CFG.MIN_ROWS:
+            ignored = f" after ignoring {zero_row_counts[label]} zero-quote row(s)" if zero_row_counts[label] else ""
             raise ValueError(
-                f"{path}: only {len(df_raw)} rows; need at least {CFG.MIN_ROWS} "
+                f"{path}: only {len(df_raw)} rows{ignored}; need at least {CFG.MIN_ROWS} "
                 f"(see config.ini [general] min_rows)."
             )
         n_raw = len(df_raw)
@@ -2692,6 +2770,7 @@ def _run_comparison_core(
     for s in report["sources"]:
         label = s["source"]
         s["file"] = labeled_paths[label].name
+        s["n_zero_rows_ignored"] = zero_row_counts[label]
         if label in raw_row_counts:
             s["raw_rows"] = raw_row_counts[label]
         if metadata_by_label:

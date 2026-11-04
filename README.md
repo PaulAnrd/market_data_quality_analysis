@@ -109,7 +109,11 @@ timestamp,best_bid_1,best_ask_1,best_bid_size_1,best_ask_size_1,best_bid_2,best_
 - Columns outside the schema are ignored.
 - A first row whose best bid or ask is empty, zero or negative is treated
   as a zeroed start-up row and dropped, with a logged warning.
-- A file with fewer than `[general] min_rows` rows is rejected.
+- Recordings that write 0 for "no value" (placeholder updates, empty depth
+  levels, missing sizes) can be read with `[general] ignore_zeros = true`;
+  see section 2.
+- A file with fewer than `[general] min_rows` rows is rejected, counted
+  after zero-quote rows are ignored.
 
 **Filename convention.** Comparison inputs are grouped automatically when
 the filename starts with a date and a product:
@@ -152,7 +156,7 @@ instrument, or `report_dir/compare_<UTC-timestamp>/` for an ungrouped run:
 
 | File | Content |
 |---|---|
-| `comparison_report.json` | `sources` (rows, session bounds, file, metadata), the alignment parameters actually used, `window_start`, `window_end`, `n_grid_points`, `pairs` (statistics of section 4 plus `top_divergences`), `status`, and `attribution` and `instrument` when grouped |
+| `comparison_report.json` | `sources` (rows, zero-quote rows ignored, session bounds, file, metadata), the alignment parameters actually used, `window_start`, `window_end`, `n_grid_points`, `pairs` (statistics of section 4 plus `top_divergences`), `status`, and `attribution` and `instrument` when grouped |
 | `plots/*.png` | mid price overlaid by source, a difference plot and a difference histogram per pair |
 | `comparison_dashboard.html` | same layout as the per-recording dashboard |
 
@@ -214,9 +218,35 @@ template. Defaults below are as shipped.
 | Key | Default | Meaning |
 |---|---|---|
 | `min_rows` | 40 | a file with fewer rows is rejected (must be >= 1) |
+| `ignore_zeros` | false | treat zero prices and sizes as "no value" instead of data (below) |
 | `max_memory_budget_gb` | 16 | process memory budget |
 | `memory_overhead_multiplier` | 6 | assumed peak memory per byte of input file |
 | `grafana_export_dir` | empty | optional second copy of `report_dir/json/` |
+
+**`ignore_zeros`.** Some recordings write 0 where a field has no value: a
+placeholder update with no quote, an empty depth level, a missing size.
+Read as data, these zeros pollute every part of the report: a zero bid
+counts as a crossed book, the mid drops to half the price and back, which
+inflates the outliers and the kurtosis, the minimum price becomes 0 and the
+explorer axis is stretched to 0. With `ignore_zeros = true`:
+
+- a row whose level-1 best bid **or** best ask is exactly 0 is dropped
+  before every check, statistic, figure and comparison, since its mid is
+  meaningless;
+- in the remaining rows, a price at level 2 or deeper, or a size at any
+  level, that is exactly 0 is treated as not populated: it is not compared
+  in the level-depth checks, does not count as a non-positive size, is
+  excluded from the size medians and shows as a gap in the explorer;
+- outlier treatment leaves those zero values unchanged instead of shifting
+  them with the rest of the snapshot.
+
+Nothing is hidden: the `structural` section records `ignore_zeros`,
+`n_zero_rows_ignored` and `n_zero_values_ignored`, each comparison source
+records `n_zero_rows_ignored`, and the dashboard shows both counts. Negative
+prices and sizes and empty cells are never ignored. Leave the switch off for
+instruments where a zero bid is a genuine quote (deep out-of-the-money
+options, for instance); there the zero rows are correctly reported as
+exceptions.
 
 Three layers enforce the budget: a file is rejected before loading when
 `file size x memory_overhead_multiplier` exceeds the budget; the process
@@ -335,8 +365,10 @@ computed on $z$.
 
 Ten counts. Any non-zero value is an exception. The `structural` counts are
 evaluated on the file in its original row order; the others on the sorted
-series. The `structural` section also records `n_rows` and
-`n_levels_present`.
+series. The `structural` section also records `n_rows`,
+`n_levels_present` and the `ignore_zeros` counts of section 2. With
+`ignore_zeros` on, the checks run on the rows that remain and skip the
+zero values it sets aside.
 
 | Section | Field | Counted when |
 |---|---|---|
@@ -522,7 +554,8 @@ recomputed.
 | 3 ffill | the last unflagged mid before $t$ (no look-ahead; missing if there is none) |
 | 4 rolling_median | the centred rolling median of the recorded mid over `hampel_window` ticks, which is robust to the flagged value itself |
 
-`cleaned_data.csv` keeps only the schema columns and can be fed back
+With `ignore_zeros` on, `cleaned_data.csv` omits the zero-quote rows and
+keeps the other zero values as recorded. `cleaned_data.csv` keeps only the schema columns and can be fed back
 through `report_inputs` like any recording.
 
 ---
